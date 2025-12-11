@@ -4,6 +4,7 @@
 #include "allocator/allocator.h"
 #include "include/libcuda_hook.h"
 #include "include/memory_limit.h"
+#include "multiprocess/multiprocess_memory_limit.h"
 
 extern int pidfound;
 
@@ -133,12 +134,24 @@ CUresult cuMemoryAllocate(CUdeviceptr* dptr, size_t bytesize, void* data) {
 }
 
 CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
-    LOG_INFO("into cuMemAllocing_v2 dptr=%p bytesize=%ld",dptr,bytesize);
+    int overcommit_enabled = set_gpu_memory_overcommit();
+    CUdevice dev;
+    ENSURE_INITIALIZED();
+    CHECK_DRV_API(cuCtxGetDevice(&dev));
+    if (overcommit_enabled == 1 && overcommit_check(dev,bytesize)) {
+       LOG_INFO("Start hijacking into cuMemAllocManaged dptr=%p bytesize=%ld",dptr,bytesize);
+    }else{
+       LOG_INFO("into cuMemAllocing_v2 dptr=%p bytesize=%ld",dptr,bytesize);
+    }
     ENSURE_RUNNING();
     CUresult res = allocate_raw(dptr,bytesize);
     if (res!=CUDA_SUCCESS)
         return res;
-    LOG_INFO("res=%d, cuMemAlloc_v2 success dptr=%p bytesize=%lu",0,(void *)*dptr,bytesize);
+    if (overcommit_enabled == 1 && overcommit_check(dev,0)) {
+        LOG_INFO("res=%d, cuMemAllocManaged success dptr=%p bytesize=%lu",0,(void *)*dptr,bytesize);
+    }else{
+        LOG_INFO("res=%d, cuMemAlloc_v2 success dptr=%p bytesize=%lu",0,(void *)*dptr,bytesize);
+    }
     return CUDA_SUCCESS;
 }
 
@@ -494,7 +507,13 @@ CUresult cuMemGetInfo_v2(size_t* free, size_t* total) {
     ENSURE_INITIALIZED();
     CHECK_DRV_API(cuCtxGetDevice(&dev));
     size_t usage = get_current_device_memory_usage(cuda_to_nvml_map(dev));
-    size_t limit = get_current_device_memory_limit(cuda_to_nvml_map(dev));
+    size_t limit;
+    int overcommit_enabled = set_gpu_memory_overcommit();
+    if (overcommit_enabled == 1) {
+        limit = get_current_device_memory_limit_overcommit(cuda_to_nvml_map(dev));
+    }else{
+        limit = get_current_device_memory_limit(cuda_to_nvml_map(dev));
+    }
     if (limit == 0) {
         CUDA_OVERRIDE_CALL(cuda_library_entry,cuMemGetInfo_v2, free, total);
         LOG_INFO("orig free=%ld total=%ld", *free, *total);
