@@ -833,6 +833,15 @@ uint64_t get_current_device_memory_limit(const int dev) {
     return region_info.shared_region->limit[dev];       
 }
 
+uint64_t get_current_device_memory_limit_overcommit(const int dev) {
+    ensure_initialized();
+    if (dev < 0 || dev >= CUDA_DEVICE_MAX_COUNT) {
+        LOG_ERROR("Illegal device id: %d", dev);
+    }
+    uint64_t original = region_info.shared_region->limit[dev];
+    return (original * 12ULL) / 10ULL;
+}
+
 uint64_t get_current_device_memory_monitor(const int dev) {
     ensure_initialized();
     if (dev < 0 || dev >= CUDA_DEVICE_MAX_COUNT) {

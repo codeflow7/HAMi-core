@@ -165,3 +165,6 @@ int free_raw_async(CUdeviceptr dptr, CUstream hStream);
 // Checks memory type
 int check_memory_type(CUdeviceptr address);
 
+int set_gpu_memory_overcommit();
+
+int overcommit_check(CUdevice dev, size_t addon);

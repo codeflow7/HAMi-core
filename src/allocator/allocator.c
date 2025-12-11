@@ -2,6 +2,7 @@
 #include "include/log_utils.h"
 #include "include/libcuda_hook.h"
 #include "multiprocess/multiprocess_memory_limit.h"
+#include <cuda.h>
 
 
 size_t BITSIZE = 512;
@@ -33,6 +34,23 @@ size_t round_up(size_t size, size_t unit) {
     return size;
 }
 
+int set_gpu_memory_overcommit() {
+    char *overcommit_env;
+    overcommit_env = getenv("ACTIVE_GPU_MEMORY_OVERCOMMIT");
+
+    if (overcommit_env != NULL) {
+        if (strcmp(overcommit_env, "true") == 0 ||
+            strcmp(overcommit_env, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(overcommit_env, "false") == 0 ||
+            strcmp(overcommit_env, "0") == 0) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 int oom_check(const int dev, size_t addon) {
     int count1=0;
     CUDA_OVERRIDE_CALL(cuda_library_entry,cuDeviceGetCount,&count1);
@@ -41,7 +59,14 @@ int oom_check(const int dev, size_t addon) {
         cuCtxGetDevice(&d);
     else
         d=dev;
-    uint64_t limit = get_current_device_memory_limit(d);
+
+    uint64_t limit;
+    int overcommit_enabled = set_gpu_memory_overcommit();
+    if (overcommit_enabled == 1) {
+        limit = get_current_device_memory_limit_overcommit(d);
+    }else{
+        limit = get_current_device_memory_limit(d);
+    }
     size_t _usage = get_gpu_memory_usage(d);
 
     if (limit == 0) {
@@ -51,7 +76,7 @@ int oom_check(const int dev, size_t addon) {
     size_t new_allocated = _usage + addon;
     LOG_INFO("_usage=%lu limit=%lu new_allocated=%lu",_usage,limit,new_allocated);
     if (new_allocated > limit) {
-        LOG_ERROR("Device %d OOM %lu / %lu", d, new_allocated, limit);
+        LOG_WARN("Device %d OOM %lu / %lu", d, new_allocated, limit);
 
         if (clear_proc_slot_nolock(1) > 0)
             return oom_check(dev,addon);
@@ -118,7 +143,33 @@ int add_chunk(CUdeviceptr *address, size_t size) {
         res = cuMemoryAllocate(&e->entry->address, size, e->entry->allocHandle);
     }
     if (res!=CUDA_SUCCESS){
-        LOG_ERROR("cuMemoryAllocate failed res=%d",res);
+        LOG_WARN("cuMemoryAllocate failed res=%d",res);
+        return res;
+    }
+    LIST_ADD(device_overallocated,e);
+    //uint64_t t_size;
+    *address = e->entry->address;
+    allocsize = size;
+    cuCtxGetDevice(&dev);
+    add_gpu_device_memory_usage(getpid(), dev, allocsize, 2);
+    return 0;
+}
+
+int add_chunk_only_overcommit(CUdeviceptr *address, size_t size) {
+    size_t addr=0;
+    size_t allocsize;
+    CUresult res = CUDA_SUCCESS;
+    CUdevice dev;
+    cuCtxGetDevice(&dev);
+    if (oom_check(dev,size)){
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+
+    allocated_list_entry *e;
+    INIT_ALLOCATED_LIST_ENTRY(e,addr,size);
+    res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuMemAllocManaged,&e->entry->address,size,CU_MEM_ATTACH_GLOBAL);
+    if (res!=CUDA_SUCCESS){
+        LOG_WARN("cuMemAllocManaged failed res=%d",res);
         return res;
     }
     LIST_ADD(device_overallocated,e);
@@ -202,10 +253,39 @@ int remove_chunk_only(CUdeviceptr dptr) {
     return -1;
 }
 
+int overcommit_check(CUdevice dev, size_t addon) {
+    uint64_t limit = get_current_device_memory_limit(dev);
+    size_t _usage = get_gpu_memory_usage(dev);
+    if (limit == 0) {
+        return 0;
+    }
+    // 超分触发阈值（95%）
+    double threshold_ratio = 0.95;
+    uint64_t overcommit_threshold = (uint64_t)(limit * threshold_ratio);
+    size_t new_allocated = _usage + addon;
+    LOG_INFO("_usage=%lu limit=%lu new_allocated=%lu",_usage,limit,new_allocated);
+    if (new_allocated > overcommit_threshold) {
+        LOG_INFO("Device %d needs overcommit: required_total=%lu (current: %lu + addon: %lu) > 85%%_threshold=%lu",
+                   dev, new_allocated, _usage, addon, overcommit_threshold);
+        if (clear_proc_slot_nolock(1) > 0)
+            return overcommit_check(dev,addon);
+        return 1;
+    }
+    return 0;
+}
+
 int allocate_raw(CUdeviceptr *dptr, size_t size) {
     int tmp;
     pthread_mutex_lock(&mutex);
-    tmp = add_chunk(dptr, size);
+    int overcommit_enabled = set_gpu_memory_overcommit();
+    CUdevice dev;
+    ENSURE_INITIALIZED();
+    CHECK_DRV_API(cuCtxGetDevice(&dev));
+    if (overcommit_enabled == 1 && overcommit_check(dev,size)) {
+        tmp = add_chunk_only_overcommit(dptr, size);
+    } else {
+        tmp = add_chunk(dptr, size);
+    }
     pthread_mutex_unlock(&mutex);
     return tmp;
 }
